@@ -99,3 +99,24 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 pytest
 ```
+
+## Changelog
+
+### v0.3.0
+- CI/CD pipeline generation (`.github/workflows/ci.yml`) for Python and Node.js
+- Auto-detects test commands and Python/Node version matrix
+- Pipeline runs on push/PR with multi-version test matrix
+
+### v0.2.1
+- Node.js/npm project support — `package.json` analysis, framework detection, `npm install`
+- Generated Dockerfile adapts to Node.js projects with correct base image
+
+### v0.2.0
+- Import inference — AST-based scanner builds `requirements.txt` from `import` statements
+- Python version detection from code syntax (f-strings→3.6, match/case→3.10, etc.)
+- Auto-generates `Dockerfile` and `README.md` for Python projects
+
+### v0.1.0
+- Core pipeline: Analyze → Build → Repair → Verify
+- opencode-powered LLM code repair
+- Tested on genuine 2015–2020 abandoned repos

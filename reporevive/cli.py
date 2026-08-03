@@ -19,6 +19,7 @@ from reporevive.infer import (
 from reporevive.lang_node import (
     analyze_node, build_node, check_node_entry, generate_node_dockerfile,
 )
+from reporevive.ci_gen import generate_ci_python, generate_ci_node
 
 
 @click.group()
@@ -135,6 +136,10 @@ def revive(url: str, target: str | None, model: str, max_rounds: int, no_repair:
     if readme:
         generated.append("README")
 
+    if not analysis.has_ci:
+        generate_ci_python(repo_path, analysis.python_version or "3.10", bool(analysis.test_framework))
+        generated.append("CI")
+
     # Summary
     console.print()
     console.print(Panel.fit(
@@ -198,6 +203,7 @@ def generate(path: str):
         node = analyze_node(repo_path)
         generate_node_dockerfile(repo_path, node)
         generate_readme(repo_path)
+        generate_ci_node(repo_path, node.node_version or "18", "test" in node.scripts)
         console.print("\n[green]✓ Done[/green]")
         return
 
@@ -227,6 +233,10 @@ def generate(path: str):
 
     # README
     generate_readme(repo_path)
+
+    # CI
+    if not (repo_path / ".github" / "workflows").exists():
+        generate_ci_python(repo_path, ver or "3.10", True)
 
     console.print("\n[green]✓ Done[/green]")
 
@@ -270,6 +280,10 @@ def _revive_node(repo_path: Path, url: str, model: str, max_rounds: int, no_repa
     readme = generate_readme(repo_path)
     if readme:
         generated.append("README")
+
+    if not (repo_path / ".github" / "workflows").exists():
+        generate_ci_node(repo_path, node.node_version or "18", "test" in node.scripts)
+        generated.append("CI")
 
     # Summary
     console.print()
