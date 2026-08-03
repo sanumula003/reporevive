@@ -45,7 +45,6 @@ class Repairer:
         self.model = model
 
     def repair(self, analysis: RepoAnalysis, errors: list[str], repo_path: Path, max_rounds: int = 3) -> int:
-        """Run the repair pipeline. Returns number of fixes applied."""
         if not errors:
             console.print("[green]No errors to repair[/green]")
             return 0
@@ -59,7 +58,7 @@ class Repairer:
         for round_num in range(1, max_rounds + 1):
             console.print(f"\n[dim]Repair round {round_num}/{max_rounds}...[/dim]")
 
-            # Gather source context
+            before = self._snapshot(repo_path)
             context = self._gather_context(analysis, repo_path, significant[:20])
 
             prompt = f"""{REPAIR_INSTRUCTIONS}
@@ -80,39 +79,70 @@ Provide fixes for ALL issues above using the exact formats specified."""
             try:
                 result = subprocess.run(
                     ["opencode", "run", prompt, "--dir", str(repo_path), "--auto", "--format", "json"],
-                    capture_output=True,
-                    text=True,
-                    timeout=300,
+                    capture_output=True, text=True, timeout=300,
                 )
                 reply = self._parse_opencode_output(result.stdout)
-                if not reply:
-                    console.print("[dim]Opencode returned no content[/dim]")
-                    break
+                text_fixes = self._apply_fixes(reply, repo_path)
 
-                applied = self._apply_fixes(reply, repo_path)
-                self.fixes_applied += applied
+                after = self._snapshot(repo_path)
+                file_fixes = self._count_changes(before, after, repo_path)
 
-                if applied == 0:
-                    console.print("[dim]No fixes applied this round[/dim]")
+                round_fixes = text_fixes + file_fixes
+                self.fixes_applied += round_fixes
+
+                if round_fixes == 0:
+                    console.print("[dim]No changes detected[/dim]")
                     break
 
             except subprocess.TimeoutExpired:
-                console.print("[red]Opencode timed out[/red]")
+                console.print("[yellow]Timed out — checking for file changes...[/yellow]")
+                after = self._snapshot(repo_path)
+                file_fixes = self._count_changes(before, after, repo_path)
+                if file_fixes > 0:
+                    self.fixes_applied += file_fixes
                 break
             except Exception as e:
-                console.print(f"[red]Repair error:[/red] {e}")
+                console.print(f"[red]Error:[/red] {e}")
                 break
 
-        console.print(f"\n[bold]Total fixes applied: [green]{self.fixes_applied}[/green][/bold]")
+        console.print(f"\n[bold]Fixes applied: [green]{self.fixes_applied}[/green][/bold]")
         return self.fixes_applied
 
+    def _snapshot(self, repo_path: Path) -> dict:
+        snap = {}
+        for f in repo_path.rglob("*.py"):
+            if any(x in str(f) for x in (".venv", "__pycache__", ".phoenix-venv")):
+                continue
+            try:
+                snap[str(f)] = f.read_text()
+            except Exception:
+                pass
+        for name in ("requirements.txt", "setup.py", "setup.cfg", "pyproject.toml"):
+            fp = repo_path / name
+            if fp.exists():
+                try:
+                    snap[str(fp)] = fp.read_text()
+                except Exception:
+                    pass
+        return snap
+
+    def _count_changes(self, before: dict, after: dict, repo_path: Path) -> int:
+        fixes = 0
+        for path, content in after.items():
+            if path not in before or before[path] != content:
+                try:
+                    rel = Path(path).relative_to(repo_path)
+                except Exception:
+                    rel = path
+                console.print(f"  [green]✓[/green] Modified: {rel}")
+                fixes += 1
+        return fixes
+
     def _gather_context(self, analysis: RepoAnalysis, repo_path: Path, errors: list[str]) -> str:
-        """Gather relevant source files for context (trimmed for speed)."""
         parts = []
         total_chars = 0
         max_chars = 6000
 
-        # 1. Add dependency files (most important)
         for f in analysis.dependency_files:
             try:
                 content = read_file(f)
@@ -122,8 +152,7 @@ Provide fixes for ALL issues above using the exact formats specified."""
             except Exception:
                 pass
 
-        # 2. Add setup.py/pyproject.toml if not already included
-        for f in ["setup.py", "pyproject.toml", "setup.cfg"]:
+        for f in ("setup.py", "pyproject.toml", "setup.cfg"):
             fp = repo_path / f
             if fp.exists() and fp not in analysis.dependency_files:
                 try:
@@ -134,14 +163,11 @@ Provide fixes for ALL issues above using the exact formats specified."""
                 except Exception:
                     pass
 
-        # 3. Add top-level Python files (not venvs, not tests)
         py_files = sorted(repo_path.glob("*.py"))[:5]
         py_files += [p for p in sorted(repo_path.rglob("*.py"))
                      if p.parent != repo_path
-                     and ".venv" not in str(p)
-                     and "__pycache__" not in str(p)
-                     and ".phoenix-venv" not in str(p)
-                     and "test" not in str(p).lower()][:8]
+                     and not any(x in str(p) for x in (".venv", "__pycache__", ".phoenix-venv", "test"))
+                     ][:8]
 
         for f in py_files:
             if total_chars > max_chars:
@@ -155,16 +181,12 @@ Provide fixes for ALL issues above using the exact formats specified."""
             except Exception:
                 pass
 
-        # 4. Add errors
         parts.append("=== BUILD ERRORS ===\n" + "\n".join(errors[:10]))
-
         return "\n\n".join(parts)
 
     def _parse_opencode_output(self, stdout: str) -> str:
-        """Extract the text content from opencode JSON output."""
         if not stdout.strip():
             return ""
-
         texts = []
         for line in stdout.strip().split("\n"):
             try:
@@ -176,11 +198,9 @@ Provide fixes for ALL issues above using the exact formats specified."""
                         texts.append(text)
             except json.JSONDecodeError:
                 continue
-
         return "\n".join(texts)
 
     def _apply_fixes(self, response: str, repo_path: Path) -> int:
-        """Parse LLM response and apply file/dependency fixes. Returns count."""
         applied = 0
         current_file = None
         current_content = []
@@ -188,19 +208,14 @@ Provide fixes for ALL issues above using the exact formats specified."""
 
         for line in response.splitlines():
             stripped = line.strip()
-
-            # Detect code blocks with file markers
             if stripped.startswith("```") and "# FIX:" in stripped:
-                # End any previous block
                 if current_file and current_content:
                     self._write_fix(current_file, current_content, repo_path)
                     applied += 1
-                # Start new block
                 current_file = stripped.split("# FIX:", 1)[1].strip().split("```")[0].strip()
                 current_content = []
                 in_code_block = True
                 continue
-
             if stripped == "```" and in_code_block:
                 in_code_block = False
                 if current_file and current_content:
@@ -208,18 +223,14 @@ Provide fixes for ALL issues above using the exact formats specified."""
                     applied += 1
                 current_file = None
                 continue
-
-            # Dependency additions
             if stripped.startswith("# DEP:") or stripped.startswith("DEP:"):
                 dep = stripped.split("DEP:", 1)[1].strip()
                 if dep:
                     self._add_dependency(dep, repo_path)
                     applied += 1
-
             if in_code_block and current_file:
                 current_content.append(line)
 
-        # Save last file
         if current_file and current_content:
             self._write_fix(current_file, current_content, repo_path)
             applied += 1
@@ -227,22 +238,17 @@ Provide fixes for ALL issues above using the exact formats specified."""
         return applied
 
     def _write_fix(self, rel_path: str, content_lines: list[str], repo_path: Path) -> None:
-        """Write a fixed file."""
         target = repo_path / rel_path
         content = "\n".join(content_lines).strip() + "\n"
-
-        if content == "\n" or content == "`\n":
+        if content in ("\n", "`\n"):
             return
-
         original = read_file(target) if target.exists() else ""
         if original == content:
             return
-
         write_file(target, content)
         console.print(f"  [green]✓[/green] Fixed: {rel_path}")
 
     def _add_dependency(self, dep_spec: str, repo_path: Path) -> None:
-        """Add a dependency to requirements.txt."""
         req_file = repo_path / "requirements.txt"
         if req_file.exists():
             content = read_file(req_file)
