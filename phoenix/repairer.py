@@ -1,84 +1,48 @@
-"""LLM-based code repair pipeline.
+"""LLM-based code repair pipeline powered by opencode CLI."""
 
-Takes build errors, analyzes source files, and generates fixes using an LLM.
-"""
-
-import os
+import json
+import subprocess
 from pathlib import Path
-
-from openai import OpenAI
 
 from phoenix.utils import read_file, write_file, console
 from phoenix.analyzer import RepoAnalysis
 
-SYSTEM_PROMPT = """You are an expert Python software engineer specializing in resurrecting abandoned repositories.
-Your job: analyze build/import errors in a Python project and output precise code fixes.
+REPAIR_INSTRUCTIONS = """You are an expert Python software engineer. Your job: analyze build/install errors in a Python project and output precise code fixes.
 
-Rules:
-1. Return ONLY the fix - no explanations, no markdown, no code fences
-2. Each fix must be a complete file rewrite or a targeted edit
-3. Use the format: --- FILE: path/to/file.py --- then the complete new file content
-4. For dependency issues, output: --- DEP: package_name>=version --- on separate lines
-5. Fix only what's broken - don't refactor working code
-6. Preserve the original code's style, comments, and structure wherever possible
-7. If a package doesn't exist anymore, suggest the replacement package
+RULES (follow strictly):
+1. Output ONLY file patches and dependency changes — no explanations, no markdown, no chat
+2. Format for file fixes:
+   ```python
+   # FIX: path/to/file.py
+   (complete new file content)
+   ```
+3. Format for dependency additions (new packages needed):
+   # DEP: package_name>=version
+4. Fix ONLY what's broken — don't refactor working code
+5. Preserve the original code's style and structure wherever possible
+6. If a package doesn't exist anymore, suggest the replacement
 
-Common Python migration patterns:
-- collections.MutableMapping → collections.abc.MutableMapping
-- inspect.getargspec → inspect.getfullargspec
-- import imp → import importlib
-- unicode → str
-- basestring → str
-- cPickle → pickle
+Common Python migration issues to check:
+- collections.MutableMapping → collections.abc.MutableMapping (Python 3.10+)
+- imports from collections.abc for all ABCs (Iterable, Mapping, Sequence, etc.)
+- urlparse → urllib.parse.urlparse (Python 3)
 - ConfigParser → configparser
-- urllib2 → urllib.request
 - StringIO.StringIO → io.StringIO
-- thread → _thread
-- Queue → queue
+- cPickle → pickle
+- basestring → str
+- unicode → str
+- Queue → queue (Python 3)
+- inspect.getargspec → inspect.getfullargspec
 - AnyStr.DEFAULT_TYPE → AnyStr (newer typing)
 """
 
-FIX_PROMPT = """A Python project has the following build/install errors:
-
-Project: {project_path}
-Python version target: {python_version}
-Detected frameworks: {frameworks}
-
-Errors:
-{errors}
-
-Source files in the project:
-{source_files}
-
-Relevant source content:
-{relevant_sources}
-
-Provide fixes for ALL issues above. Output format:
---- FILE: path/to/file.py ---
-(complete fixed file content)
-
---- DEP: package_name>=version ---
-(for dependency additions)"""
-
 
 class Repairer:
-    """LLM-powered code repair engine."""
+    """Code repair engine powered by opencode CLI."""
 
-    def __init__(self, model: str = "gpt-4o-mini"):
-        self.model = model
-        self.client = None
+    def __init__(self, model: str = ""):
         self.fixes_applied = 0
-
-    def _get_client(self) -> OpenAI:
-        if self.client is None:
-            api_key = os.environ.get("OPENAI_API_KEY")
-            if not api_key:
-                raise RuntimeError(
-                    "OPENAI_API_KEY environment variable not set. "
-                    "Set it with: export OPENAI_API_KEY=sk-..."
-                )
-            self.client = OpenAI(api_key=api_key)
-        return self.client
+        self.model = model
 
     def repair(self, analysis: RepoAnalysis, errors: list[str], repo_path: Path, max_rounds: int = 3) -> int:
         """Run the repair pipeline. Returns number of fixes applied."""
@@ -86,64 +50,43 @@ class Repairer:
             console.print("[green]No errors to repair[/green]")
             return 0
 
-        # Filter to meaningful errors
-        significant_errors = [e for e in errors if len(e) > 10 and "warning" not in e.lower()]
-        if not significant_errors:
-            significant_errors = errors[:20]
+        significant = [e for e in errors if len(e) > 10 and "warning" not in e.lower()]
+        if not significant:
+            significant = errors[:20]
 
-        console.print(f"\n[bold yellow]🔧 Starting repair — {len(significant_errors)} errors[/bold yellow]")
+        console.print(f"\n[bold yellow]🔧 Starting repair — {len(significant)} errors[/bold yellow]")
 
         for round_num in range(1, max_rounds + 1):
             console.print(f"\n[dim]Repair round {round_num}/{max_rounds}...[/dim]")
 
-            # Gather source files
-            py_files = sorted(repo_path.rglob("*.py"))
-            source_map = {}
-            relevant_sources = ""
+            # Gather source context
+            context = self._gather_context(analysis, repo_path, significant[:20])
 
-            # Read key files: setup.py, requirements.txt, and main modules
-            for f in py_files:
-                if f.name in ("setup.py", "setup.cfg", "conftest.py", "__init__.py"):
-                    try:
-                        content = read_file(f)
-                        source_map[str(f.relative_to(repo_path))] = content
-                        relevant_sources += f"\n--- {f.relative_to(repo_path)} ---\n{content[:3000]}\n"
-                    except Exception:
-                        pass
+            prompt = f"""{REPAIR_INSTRUCTIONS}
 
-            # Read dependency files
-            for f in analysis.dependency_files:
-                try:
-                    content = read_file(f)
-                    relevant_sources += f"\n--- {f.relative_to(repo_path)} ---\n{content[:3000]}\n"
-                except Exception:
-                    pass
+The project at {repo_path} has the following build/install errors:
 
-            # Build prompt
-            prompt = FIX_PROMPT.format(
-                project_path=str(repo_path),
-                python_version=analysis.python_version or "3.10+",
-                frameworks=", ".join(analysis.frameworks) if analysis.frameworks else "unknown",
-                errors="\n".join(significant_errors[:15]),
-                source_files="\n".join(f"  {f}" for f in sorted(source_map.keys())[:30]),
-                relevant_sources=relevant_sources[:8000],
-            )
+Python version target: {analysis.python_version or '3.10+'}
+Detected frameworks: {', '.join(analysis.frameworks) if analysis.frameworks else 'unknown'}
+
+Errors:
+{chr(10).join(significant[:15])}
+
+Current project files and their contents:
+{context}
+
+Provide fixes for ALL issues above using the exact formats specified."""
 
             try:
-                client = self._get_client()
-                response = client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt},
-                    ],
-                    temperature=0.2,
-                    max_tokens=4000,
+                result = subprocess.run(
+                    ["opencode", "run", prompt, "--dir", str(repo_path), "--auto", "--format", "json"],
+                    capture_output=True,
+                    text=True,
+                    timeout=180,
                 )
-
-                reply = response.choices[0].message.content
+                reply = self._parse_opencode_output(result.stdout)
                 if not reply:
-                    console.print("[dim]LLM returned empty response[/dim]")
+                    console.print("[dim]Opencode returned no content[/dim]")
                     break
 
                 applied = self._apply_fixes(reply, repo_path)
@@ -153,46 +96,102 @@ class Repairer:
                     console.print("[dim]No fixes applied this round[/dim]")
                     break
 
+            except subprocess.TimeoutExpired:
+                console.print("[red]Opencode timed out[/red]")
+                break
             except Exception as e:
-                console.print(f"[red]LLM error:[/red] {e}")
+                console.print(f"[red]Repair error:[/red] {e}")
                 break
 
         console.print(f"\n[bold]Total fixes applied: [green]{self.fixes_applied}[/green][/bold]")
         return self.fixes_applied
 
-    def _apply_fixes(self, llm_response: str, repo_path: Path) -> int:
+    def _gather_context(self, analysis: RepoAnalysis, repo_path: Path, errors: list[str]) -> str:
+        """Gather relevant source files for context."""
+        parts = []
+
+        # Add dependency files
+        for f in analysis.dependency_files:
+            try:
+                content = read_file(f)
+                parts.append(f"=== {f.relative_to(repo_path)} ===\n{content[:5000]}")
+            except Exception:
+                pass
+
+        # Add Python source files (excluding venvs and caches)
+        py_files = [p for p in sorted(repo_path.rglob("*.py"))
+                    if ".venv" not in str(p) and "__pycache__" not in str(p)
+                    and ".phoenix-venv" not in str(p)]
+        for f in py_files[:20]:
+            try:
+                content = read_file(f)
+                if content.strip():
+                    parts.append(f"=== {f.relative_to(repo_path)} ===\n{content[:5000]}")
+            except Exception:
+                pass
+
+        # Add errors as context
+        parts.append(f"=== BUILD ERRORS ===\n" + "\n".join(errors[:10]))
+
+        return "\n\n".join(parts)
+
+    def _parse_opencode_output(self, stdout: str) -> str:
+        """Extract the text content from opencode JSON output."""
+        if not stdout.strip():
+            return ""
+
+        texts = []
+        for line in stdout.strip().split("\n"):
+            try:
+                data = json.loads(line)
+                if data.get("type") == "text":
+                    part = data.get("part", {})
+                    text = part.get("text", "")
+                    if text:
+                        texts.append(text)
+            except json.JSONDecodeError:
+                continue
+
+        return "\n".join(texts)
+
+    def _apply_fixes(self, response: str, repo_path: Path) -> int:
         """Parse LLM response and apply file/dependency fixes. Returns count."""
         applied = 0
         current_file = None
         current_content = []
-        current_mode = None
+        in_code_block = False
 
-        for line in llm_response.splitlines():
-            line = line.strip()
+        for line in response.splitlines():
+            stripped = line.strip()
 
-            if line.startswith("--- FILE:") and "---" in line[8:]:
-                # Save previous file
+            # Detect code blocks with file markers
+            if stripped.startswith("```") and "# FIX:" in stripped:
+                # End any previous block
                 if current_file and current_content:
                     self._write_fix(current_file, current_content, repo_path)
                     applied += 1
-
-                # Start new file
-                parts = line.split("--- FILE:", 1)[1].strip()
-                current_file = parts.split("---")[0].strip()
+                # Start new block
+                current_file = stripped.split("# FIX:", 1)[1].strip().split("```")[0].strip()
                 current_content = []
-                current_mode = "file"
+                in_code_block = True
+                continue
 
-            elif line.startswith("--- DEP:"):
-                # Dependency fix
-                dep_spec = line.split("--- DEP:", 1)[1].strip()
-                if dep_spec:
-                    self._add_dependency(dep_spec, repo_path)
+            if stripped == "```" and in_code_block:
+                in_code_block = False
+                if current_file and current_content:
+                    self._write_fix(current_file, current_content, repo_path)
+                    applied += 1
+                current_file = None
+                continue
+
+            # Dependency additions
+            if stripped.startswith("# DEP:") or stripped.startswith("DEP:"):
+                dep = stripped.split("DEP:", 1)[1].strip()
+                if dep:
+                    self._add_dependency(dep, repo_path)
                     applied += 1
 
-            elif current_file and current_mode == "file":
-                # Don't include trailing --- markers
-                if line.startswith("---") and not line.startswith("--- FILE:") and not line.startswith("--- DEP:"):
-                    continue
+            if in_code_block and current_file:
                 current_content.append(line)
 
         # Save last file
@@ -205,17 +204,12 @@ class Repairer:
     def _write_fix(self, rel_path: str, content_lines: list[str], repo_path: Path) -> None:
         """Write a fixed file."""
         target = repo_path / rel_path
-
-        # Normalize content
         content = "\n".join(content_lines).strip() + "\n"
-        if content == "\n":
+
+        if content == "\n" or content == "`\n":
             return
 
-        # Read original for comparison
-        original = ""
-        if target.exists():
-            original = read_file(target)
-
+        original = read_file(target) if target.exists() else ""
         if original == content:
             return
 
