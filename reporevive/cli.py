@@ -20,6 +20,9 @@ from reporevive.lang_node import (
     analyze_node, build_node, check_node_entry, generate_node_dockerfile,
 )
 from reporevive.ci_gen import generate_ci_python, generate_ci_node
+from reporevive.sandbox import has_docker, build_in_sandbox
+from reporevive.checkpoint import save as save_checkpoint, load as load_checkpoint, discard as discard_checkpoint
+from reporevive.receipt import generate as generate_receipt
 
 
 @click.group()
@@ -35,7 +38,9 @@ def main():
 @click.option("--model", "-m", default="gpt-4o-mini", help="Model for code repair")
 @click.option("--max-rounds", default=3, help="Maximum repair rounds")
 @click.option("--no-repair", is_flag=True, help="Skip LLM repair, just analyze and build")
-def revive(url: str, target: str | None, model: str, max_rounds: int, no_repair: bool):
+@click.option("--sandbox", is_flag=True, help="Run build inside a Docker container")
+@click.option("--resume", is_flag=True, help="Resume from a previous checkpoint")
+def revive(url: str, target: str | None, model: str, max_rounds: int, no_repair: bool, sandbox: bool, resume: bool):
     """Resurrect an abandoned GitHub repository.
 
     URL: GitHub repository URL or local path.
@@ -82,9 +87,23 @@ def revive(url: str, target: str | None, model: str, max_rounds: int, no_repair:
             generate_requirements(repo_path, packages)
             analysis = analyze(repo_path)  # re-analyze with new deps
 
+    # Check for checkpoint resume
+    checkpoint = None
+    if resume:
+        checkpoint = load_checkpoint(repo_path)
+
     # Step 3: Build environment
     console.print("\n[bold cyan]📦 Building environment...[/bold cyan]")
-    build_result = setup_environment(analysis, repo_path)
+    if sandbox and has_docker():
+        sandbox_ok, sandbox_errors = build_in_sandbox(repo_path, analysis.language, analysis.python_version or "3.10")
+        build_result = setup_environment(analysis, repo_path)
+        if sandbox_errors:
+            build_result.install_errors.extend(sandbox_errors)
+            build_result.success = False
+    else:
+        if sandbox:
+            console.print("[yellow]Docker not available, using host install[/yellow]")
+        build_result = setup_environment(analysis, repo_path)
 
     # Step 3.5: Check imports if build succeeded
     import_errors = []
@@ -96,14 +115,41 @@ def revive(url: str, target: str | None, model: str, max_rounds: int, no_repair:
     # Step 4: Repair if needed
     repairer = Repairer(model=model)
     all_errors = build_result.install_errors + build_result.missing_packages + build_result.version_conflicts + import_errors
+    before_snap = {}
+    after_snap = {}
 
     if all_errors and not no_repair:
+        # Snapshot before repair (for receipt)
+        before_snap = {}
+        for f in repo_path.rglob("*.py"):
+            if not any(x in str(f) for x in (".venv", "__pycache__", ".phoenix-venv")):
+                before_snap[str(f)] = f.read_text()
+        for name in ("requirements.txt", "setup.py", "setup.cfg", "pyproject.toml"):
+            fp = repo_path / name
+            if fp.exists():
+                before_snap[str(fp)] = fp.read_text()
+
+        if checkpoint:
+            repairer.fixes_applied = checkpoint.get("fixes_applied", 0)
+
         repairer.repair(analysis, all_errors, repo_path, max_rounds=max_rounds)
+
+        save_checkpoint(repo_path, {"round": max_rounds, "fixes_applied": repairer.fixes_applied, "errors": all_errors[:50]})
 
         console.print("\n[bold cyan]📦 Rebuilding after repairs...[/bold cyan]")
         build_result = setup_environment(analysis, repo_path)
 
+        # After snapshot for receipt
+        for f in repo_path.rglob("*.py"):
+            if not any(x in str(f) for x in (".venv", "__pycache__", ".phoenix-venv")):
+                after_snap[str(f)] = f.read_text()
+        for name in ("requirements.txt", "setup.py", "setup.cfg", "pyproject.toml"):
+            fp = repo_path / name
+            if fp.exists():
+                after_snap[str(fp)] = fp.read_text()
+
         if build_result.success:
+            discard_checkpoint(repo_path)
             import_errors = check_imports(analysis, build_result, repo_path)
             if import_errors:
                 console.print(f"[yellow]⚠[/yellow] {len(import_errors)} import errors remain after repair")
@@ -139,6 +185,11 @@ def revive(url: str, target: str | None, model: str, max_rounds: int, no_repair:
     if not analysis.has_ci:
         generate_ci_python(repo_path, analysis.python_version or "3.10", bool(analysis.test_framework))
         generated.append("CI")
+
+    # v0.4: Generate repair receipt
+    if repairer.fixes_applied > 0 or not build_result.success:
+        generate_receipt(repo_path, analysis, build_result, repairer, verification, url, before_snap, after_snap)
+        generated.append("REVIVE_REPORT.md")
 
     # Summary
     console.print()

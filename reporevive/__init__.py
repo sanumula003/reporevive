@@ -8,4 +8,4 @@ Resurrects abandoned GitHub repositories by:
 5. Producing a runnable project
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
