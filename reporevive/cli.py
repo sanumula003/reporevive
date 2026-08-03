@@ -8,13 +8,16 @@ from rich.panel import Panel
 
 from reporevive import __version__
 from reporevive.utils import clone_repo, console
-from reporevive.analyzer import analyze
+from reporevive.analyzer import analyze, RepoAnalysis
 from reporevive.environment import setup_environment, check_imports
 from reporevive.repairer import Repairer
 from reporevive.verifier import verify
 from reporevive.infer import (
     infer_dependencies, generate_requirements, detect_python_version,
     generate_dockerfile, generate_readme,
+)
+from reporevive.lang_node import (
+    analyze_node, build_node, check_node_entry, generate_node_dockerfile,
 )
 
 
@@ -60,11 +63,15 @@ def revive(url: str, target: str | None, model: str, max_rounds: int, no_repair:
     # Step 2: Analyze
     analysis = analyze(repo_path)
 
+    if analysis.language == "javascript" or analysis.language == "typescript":
+        console.print(f"\n[dim]Detected: Node.js project[/dim]")
+        _revive_node(repo_path, url, model, max_rounds, no_repair)
+        return
+
     if analysis.language != "python":
-        console.print(f"\n[yellow]⚠ RepoRevive currently focuses on Python projects.[/yellow]")
+        console.print(f"\n[yellow]⚠ RepoRevive currently supports Python and Node.js projects.[/yellow]")
         console.print(f"[dim]Detected language: {analysis.language}[/dim]")
-        if not click.confirm("Continue anyway?"):
-            return
+        return
 
     # v0.2: Infer deps if none found
     if not analysis.dependency_files:
@@ -184,6 +191,15 @@ def generate(path: str):
     has_reqs = bool(list(repo_path.glob("requirements*.txt")))
     has_setup = (repo_path / "setup.py").exists()
     has_pyproject = (repo_path / "pyproject.toml").exists()
+    has_package_json = (repo_path / "package.json").exists()
+
+    if has_package_json:
+        # Node.js project
+        node = analyze_node(repo_path)
+        generate_node_dockerfile(repo_path, node)
+        generate_readme(repo_path)
+        console.print("\n[green]✓ Done[/green]")
+        return
 
     if not has_reqs and not has_setup and not has_pyproject:
         console.print("[bold yellow]No dependency files found — inferring from imports...[/bold yellow]")
@@ -217,3 +233,55 @@ def generate(path: str):
 
 if __name__ == "__main__":
     main()
+
+
+def _revive_node(repo_path: Path, url: str, model: str, max_rounds: int, no_repair: bool):
+    """Run the revive pipeline for a Node.js project."""
+    node = analyze_node(repo_path)
+
+    if not node.has_package_json:
+        console.print("[red]No package.json found — cannot proceed[/red]")
+        return
+
+    # Build
+    console.print("\n[bold cyan]📦 Installing npm dependencies...[/bold cyan]")
+    success, errors = build_node(repo_path)
+
+    # Entry point check
+    entry_errors = check_node_entry(repo_path, node)
+
+    # Repair if needed
+    repairer = Repairer(model=model)
+    all_errors = errors + entry_errors
+
+    if all_errors and not no_repair:
+        repairer.repair(RepoAnalysis(), all_errors, repo_path, max_rounds=max_rounds)
+        console.print("\n[bold cyan]📦 Rebuilding after repairs...[/bold cyan]")
+        success, errors = build_node(repo_path)
+
+    # Generate config files
+    generated = []
+    console.print("\n[bold cyan]📝 Generating config files...[/bold cyan]")
+
+    if not (repo_path / "Dockerfile").exists():
+        generate_node_dockerfile(repo_path, node)
+        generated.append("Dockerfile")
+
+    readme = generate_readme(repo_path)
+    if readme:
+        generated.append("README")
+
+    # Summary
+    console.print()
+    console.print(Panel.fit(
+        f"[bold]Resurrection Summary[/bold]\n\n"
+        f"  Repository:     [dim]{url}[/dim]\n"
+        f"  Language:       [green]Node.js[/green]\n"
+        f"  Framework:      [yellow]{node.framework or 'none'}[/yellow]\n"
+        f"  Dependencies:   {len(node.dependencies)} runtime, {len(node.dev_dependencies)} dev\n"
+        f"  Build:          {'[green]✓[/green]' if success else '[yellow]⚠[/yellow]'}\n"
+        f"  Fixes applied:  [green]{repairer.fixes_applied}[/green]\n"
+        f"  Generated:      [green]{', '.join(generated) if generated else 'none'}[/green]\n"
+        f"\n  [dim]Output: {repo_path}[/dim]",
+        border_style="green" if success else "yellow",
+    ))
