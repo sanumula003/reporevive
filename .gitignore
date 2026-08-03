@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.phoenix-venv/
+dist/
+*.egg-info/
+build/
+.DS_Store
+*.swp
+*.swo
