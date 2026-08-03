@@ -9,8 +9,8 @@ from typing import Optional
 from packaging.requirements import Requirement
 from packaging.specifiers import SpecifierSet
 
-from phoenix.utils import run_command, read_file, write_file, console
-from phoenix.analyzer import RepoAnalysis
+from reporevive.utils import run_command, read_file, write_file, console
+from reporevive.analyzer import RepoAnalysis
 
 
 @dataclass
@@ -68,6 +68,16 @@ def setup_environment(analysis: RepoAnalysis, repo_path: Path) -> BuildResult:
             if rc != 0:
                 _parse_install_errors(out + err, result)
 
+    # Install from setup.py (fallback if no requirements.txt or pyproject.toml)
+    has_setup_py = any(f.name == "setup.py" for f in analysis.dependency_files)
+    has_any_install = req_files or any(f.name == "pyproject.toml" for f in analysis.dependency_files)
+    if has_setup_py and not has_any_install:
+        console.print("[dim]Installing from setup.py...[/dim]")
+        rc, out, err = run_command(f"{pip} install -e . 2>&1", repo_path, timeout=600)
+        result.pip_output += out + "\n" + err
+        if rc != 0:
+            _parse_install_errors(out + err, result)
+
     result.success = len(result.install_errors) == 0
 
     if result.success:
@@ -101,25 +111,28 @@ def _parse_install_errors(output: str, result: BuildResult) -> None:
             result.install_errors.append(line.strip())
 
 
-def try_import(analysis: RepoAnalysis, result: BuildResult) -> dict[str, str]:
-    """Attempt to import detected modules and return any errors."""
-    if not result.venv_path or not result.success:
-        return {}
+def check_imports(analysis: RepoAnalysis, result: BuildResult, repo_path: Path) -> list[str]:
+    """Check if key modules can be imported. Returns list of error strings."""
+    if not result.venv_path:
+        return ["No virtual environment available"]
 
     python = str(result.venv_path / "bin" / "python")
-    import_errors = {}
+    errors = []
+    seen = set()
 
-    for module in analysis.importable_modules[:20]:  # Limit to avoid timeout
-        # Only try top-level modules
+    for module in analysis.importable_modules[:15]:
         top = module.split(".")[0]
+        if top in ("test", "tests", "setup", "conftest", "docs", "examples") or top in seen:
+            continue
+        seen.add(top)
+
         rc, out, err = run_command(
             f'{python} -c "import {top}" 2>&1',
-            result.venv_path.parent,
-            timeout=30,
+            repo_path,
+            timeout=15,
         )
-        if rc != 0 and "ModuleNotFoundError" in err:
-            import_errors[module] = err.strip()
-        elif rc != 0:
-            import_errors[module] = err.strip()
+        if rc != 0:
+            error_line = err.strip().split("\n")[-1] if err.strip() else "Import failed"
+            errors.append(f"Import '{top}' failed: {error_line}")
 
-    return import_errors
+    return errors

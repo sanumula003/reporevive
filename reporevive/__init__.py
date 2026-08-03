@@ -1,4 +1,4 @@
-"""Phoenix AI — Autonomous Software Archaeologist.
+"""RepoRevive — Autonomous Software Archaeologist.
 
 Resurrects abandoned GitHub repositories by:
 1. Recreating environments

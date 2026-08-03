@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from phoenix.utils import find_files, read_file, console
+from reporevive.utils import find_files, read_file, console
 
 try:
     import tomllib
@@ -117,19 +117,56 @@ def _parse_dependencies(root: Path, dep_files: list[Path]) -> list[str]:
                     if stripped.startswith("[") or not stripped:
                         in_requires = False
         elif name == "setup.py":
+            # First pass: extract variable-based dependency lists
+            var_deps = {}
+            for line in content.splitlines():
+                stripped = line.strip()
+                # Match: VARNAME = ['pkg1', 'pkg2']
+                for quote in ('"', "'"):
+                    if '=' in stripped and '[' in stripped and ']' in stripped:
+                        parts = stripped.split('=', 1)
+                        if len(parts) == 2:
+                            varname = parts[0].strip()
+                            rest = parts[1].strip()
+                            if rest.startswith('[%s' % quote):
+                                for pkg in rest.split(quote)[1::2]:
+                                    var_deps.setdefault(varname, []).append(pkg)
+                # Match: VARNAME += ['pkg'] (list extension)
+                if '+=' in stripped and '[' in stripped:
+                    for quote in ('"', "'"):
+                        parts = stripped.split('+=', 1)
+                        if len(parts) == 2:
+                            varname = parts[0].strip()
+                            rest = parts[1].strip()
+                            if rest.startswith('[%s' % quote):
+                                for pkg in rest.split(quote)[1::2]:
+                                    var_deps.setdefault(varname, []).append(pkg)
+            # Second pass: find install_requires references
             in_requires = False
             for line in content.splitlines():
                 stripped = line.strip()
                 if "install_requires" in stripped:
                     in_requires = True
-                    for pkg in stripped.split('"')[1::2]:
-                        deps.add(_clean(pkg))
-                    if "]" in stripped:
+                    # Try direct list
+                    for quote in ('"', "'"):
+                        pkgs = stripped.split(quote)[1::2]
+                        for pkg in pkgs:
+                            cleaned = _clean(pkg)
+                            if cleaned and cleaned.isidentifier():
+                                # Could be a variable reference
+                                if cleaned in var_deps:
+                                    for vp in var_deps[cleaned]:
+                                        deps.add(_clean(vp))
+                        # Direct package names
+                        for p in pkgs:
+                            deps.add(_clean(p))
+                    if "]" in stripped and not stripped.endswith(","):
                         in_requires = False
                     continue
                 if in_requires:
-                    for pkg in stripped.split('"')[1::2]:
-                        deps.add(_clean(pkg))
+                    for quote in ('"', "'"):
+                        for pkg in stripped.split(quote)[1::2]:
+                            deps.add(_clean(pkg))
                     if "]" in stripped:
                         in_requires = False
 

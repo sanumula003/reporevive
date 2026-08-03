@@ -4,8 +4,8 @@ import json
 import subprocess
 from pathlib import Path
 
-from phoenix.utils import read_file, write_file, console
-from phoenix.analyzer import RepoAnalysis
+from reporevive.utils import read_file, write_file, console
+from reporevive.analyzer import RepoAnalysis
 
 REPAIR_INSTRUCTIONS = """You are an expert Python software engineer. Your job: analyze build/install errors in a Python project and output precise code fixes.
 
@@ -82,7 +82,7 @@ Provide fixes for ALL issues above using the exact formats specified."""
                     ["opencode", "run", prompt, "--dir", str(repo_path), "--auto", "--format", "json"],
                     capture_output=True,
                     text=True,
-                    timeout=180,
+                    timeout=300,
                 )
                 reply = self._parse_opencode_output(result.stdout)
                 if not reply:
@@ -107,31 +107,56 @@ Provide fixes for ALL issues above using the exact formats specified."""
         return self.fixes_applied
 
     def _gather_context(self, analysis: RepoAnalysis, repo_path: Path, errors: list[str]) -> str:
-        """Gather relevant source files for context."""
+        """Gather relevant source files for context (trimmed for speed)."""
         parts = []
+        total_chars = 0
+        max_chars = 6000
 
-        # Add dependency files
+        # 1. Add dependency files (most important)
         for f in analysis.dependency_files:
             try:
                 content = read_file(f)
-                parts.append(f"=== {f.relative_to(repo_path)} ===\n{content[:5000]}")
+                snippet = content[:2500]
+                parts.append(f"=== {f.relative_to(repo_path)} ===\n{snippet}")
+                total_chars += len(snippet)
             except Exception:
                 pass
 
-        # Add Python source files (excluding venvs and caches)
-        py_files = [p for p in sorted(repo_path.rglob("*.py"))
-                    if ".venv" not in str(p) and "__pycache__" not in str(p)
-                    and ".phoenix-venv" not in str(p)]
-        for f in py_files[:20]:
+        # 2. Add setup.py/pyproject.toml if not already included
+        for f in ["setup.py", "pyproject.toml", "setup.cfg"]:
+            fp = repo_path / f
+            if fp.exists() and fp not in analysis.dependency_files:
+                try:
+                    content = read_file(fp)
+                    snippet = content[:2000]
+                    parts.append(f"=== {f} ===\n{snippet}")
+                    total_chars += len(snippet)
+                except Exception:
+                    pass
+
+        # 3. Add top-level Python files (not venvs, not tests)
+        py_files = sorted(repo_path.glob("*.py"))[:5]
+        py_files += [p for p in sorted(repo_path.rglob("*.py"))
+                     if p.parent != repo_path
+                     and ".venv" not in str(p)
+                     and "__pycache__" not in str(p)
+                     and ".phoenix-venv" not in str(p)
+                     and "test" not in str(p).lower()][:8]
+
+        for f in py_files:
+            if total_chars > max_chars:
+                break
             try:
                 content = read_file(f)
                 if content.strip():
-                    parts.append(f"=== {f.relative_to(repo_path)} ===\n{content[:5000]}")
+                    snippet = content[:1500]
+                    parts.append(f"=== {f.relative_to(repo_path)} ===\n{snippet}")
+                    total_chars += len(snippet)
             except Exception:
                 pass
 
-        # Add errors as context
-        parts.append(f"=== BUILD ERRORS ===\n" + "\n".join(errors[:10]))
+        # 4. Add errors
+        parts.append("=== BUILD ERRORS ===\n" + "\n".join(errors[:10]))
 
         return "\n\n".join(parts)
 

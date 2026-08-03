@@ -3,9 +3,9 @@
 from pathlib import Path
 from dataclasses import dataclass, field
 
-from phoenix.utils import run_command, console
-from phoenix.analyzer import RepoAnalysis
-from phoenix.environment import BuildResult
+from reporevive.utils import run_command, console
+from reporevive.analyzer import RepoAnalysis
+from reporevive.environment import BuildResult
 
 
 @dataclass

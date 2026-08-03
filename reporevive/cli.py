@@ -6,21 +6,18 @@ from pathlib import Path
 import click
 from rich.panel import Panel
 
-from phoenix import __version__
-from phoenix.utils import clone_repo, console
-from phoenix.analyzer import analyze
-from phoenix.environment import setup_environment, try_import
-from phoenix.repairer import Repairer
-from phoenix.verifier import verify
+from reporevive import __version__
+from reporevive.utils import clone_repo, console
+from reporevive.analyzer import analyze
+from reporevive.environment import setup_environment, check_imports
+from reporevive.repairer import Repairer
+from reporevive.verifier import verify
 
 
 @click.group()
 @click.version_option(__version__, prog_name="phoenix")
 def main():
-    """Phoenix AI — Autonomous Software Archaeologist.
-
-    Resurrect abandoned GitHub repositories.
-    """
+    """RepoRevive — Resurrect abandoned GitHub repositories."""
     pass
 
 
@@ -39,7 +36,7 @@ def revive(url: str, target: str | None, model: str, max_rounds: int, no_repair:
     """
     console.print()
     console.print(Panel.fit(
-        f"[bold cyan]🔥 Phoenix AI[/bold cyan] [dim]v{__version__}[/dim]\n"
+        f"[bold cyan]📦 RepoRevive[/bold cyan] [dim]v{__version__}[/dim]\n"
         "[dim]Autonomous Software Archaeologist[/dim]",
         border_style="cyan",
     ))
@@ -69,19 +66,32 @@ def revive(url: str, target: str | None, model: str, max_rounds: int, no_repair:
     console.print("\n[bold cyan]📦 Building environment...[/bold cyan]")
     build_result = setup_environment(analysis, repo_path)
 
-    # Step 4: Repair if needed
-    if not build_result.success and not no_repair:
-        all_errors = build_result.install_errors + build_result.missing_packages + build_result.version_conflicts
+    # Step 3.5: Check imports if build succeeded
+    import_errors = []
+    if build_result.success:
+        import_errors = check_imports(analysis, build_result, repo_path)
+        if import_errors:
+            console.print(f"[yellow]⚠[/yellow] {len(import_errors)} import errors detected")
 
-        repairer = Repairer(model=model)
+    # Step 4: Repair if needed
+    repairer = Repairer(model=model)
+    all_errors = build_result.install_errors + build_result.missing_packages + build_result.version_conflicts + import_errors
+
+    if all_errors and not no_repair:
         repairer.repair(analysis, all_errors, repo_path, max_rounds=max_rounds)
 
         # Retry build after repair
         console.print("\n[bold cyan]📦 Rebuilding after repairs...[/bold cyan]")
         build_result = setup_environment(analysis, repo_path)
 
-    elif no_repair and not build_result.success:
-        console.print("[yellow]⚠ Build failed but --no-repair flag is set. Skipping repair.[/yellow]")
+        # Re-check imports
+        if build_result.success:
+            import_errors = check_imports(analysis, build_result, repo_path)
+            if import_errors:
+                console.print(f"[yellow]⚠[/yellow] {len(import_errors)} import errors remain after repair")
+
+    elif all_errors and no_repair:
+        console.print(f"[yellow]⚠ {len(all_errors)} issues found but --no-repair is set. Skipping repair.[/yellow]")
 
     # Step 5: Verify
     verification = verify(analysis, build_result, repo_path)
@@ -95,7 +105,7 @@ def revive(url: str, target: str | None, model: str, max_rounds: int, no_repair:
         f"  Frameworks:     [yellow]{', '.join(analysis.frameworks) or 'none'}[/yellow]\n"
         f"  Dependencies:   {len(analysis.dependencies)}\n"
         f"  Build:          {'[green]✓[/green]' if build_result.success else '[yellow]⚠[/yellow]'}\n"
-        f"  Fixes applied:  [green]{repairer.fixes_applied if 'repairer' in dir() else 0}[/green]\n"
+        f"  Fixes applied:  [green]{repairer.fixes_applied}[/green]\n"
         f"  Tests passed:   {verification.tests_passed}/{verification.tests_passed + verification.tests_failed}\n"
         f"  Verified:       {'[green]✓[/green]' if verification.passed else '[yellow]⚠[/yellow]'}\n"
         f"\n  [dim]Output: {repo_path}[/dim]",
